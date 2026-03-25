@@ -1,3 +1,4 @@
+# 后端对话流式 / RAG 等路由复用下列依赖，无单独新增包（与 FastAPI + OpenAI + Chroma 一致）
 fastapi
 uvicorn
 python-multipart
@@ -5,6 +6,10 @@ openai
 pdfplumber
 pymupdf
 python-docx
+markdown
+htmldocx
+openpyxl
+xlrd
 sqlmodel
 chromadb
 python-dotenv

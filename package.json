@@ -9,8 +9,12 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "@blocknote/core": "latest",
-    "@blocknote/react": "latest",
+    "@blocknote/core": "0.47.2",
+    "@blocknote/mantine": "0.47.2",
+    "@blocknote/react": "0.47.2",
+    "@mantine/core": "^8.3.11",
+    "@mantine/hooks": "^8.3.11",
+    "@mantine/utils": "^6.0.22",
     "@radix-ui/react-dialog": "latest",
     "@radix-ui/react-slot": "latest",
     "class-variance-authority": "latest",
@@ -19,9 +23,14 @@
     "next": "latest",
     "react": "latest",
     "react-dom": "latest",
+    "react-icons": "^5.5.0",
+    "react-markdown": "^10.1.0",
+    "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1",
     "tailwind-merge": "latest"
   },
   "devDependencies": {
+    "@tailwindcss/typography": "^0.5.19",
     "@types/node": "latest",
     "@types/react": "latest",
     "@types/react-dom": "latest",

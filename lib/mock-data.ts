@@ -7,7 +7,10 @@ export type ProjectItem = {
 export type FileItem = {
   id: string;
   name: string;
-  type: "ZIP" | "PDF" | "WORD" | "图片" | "其他";
+  type: "ZIP" | "PDF" | "WORD" | "图片" | "文本" | "Excel" | "CSV" | "其他";
+  rel_path?: string;
+  readable?: boolean;
+  unreadable_reason?: string;
   referenced: boolean;
 };
 

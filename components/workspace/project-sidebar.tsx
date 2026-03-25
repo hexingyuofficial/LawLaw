@@ -6,6 +6,7 @@ import { Pencil, Plus, Settings, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { getBackendApiUrl } from "@/lib/backend-url";
 import {
   API_KEY_STORAGE,
   CHAT_VISION_ENDPOINT_STORAGE,
@@ -24,16 +25,6 @@ type ProjectSidebarProps = {
   onSelectProject: (projectId: number | null) => void;
   onProjectChange?: (projects: Project[]) => void;
 };
-
-function getBackendApiUrl(path: string) {
-  if (typeof window === "undefined") {
-    return `http://localhost:8000${path}`;
-  }
-  const isLoopbackHost =
-    window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
-  const backendHost = isLoopbackHost ? window.location.hostname : "localhost";
-  return `${window.location.protocol}//${backendHost}:8000${path}`;
-}
 
 function readableApiError(err: unknown, fallback: string) {
   if (err instanceof Error) {

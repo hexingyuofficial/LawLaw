@@ -68,6 +68,8 @@ def infer_doc_type(file_path: Path) -> str:
         return "文本材料"
     if ext in {".pdf", ".doc", ".docx"}:
         return "卷宗材料"
+    if ext in {".xlsx", ".xls", ".csv"}:
+        return "表格材料"
     return "其他"
 
 
