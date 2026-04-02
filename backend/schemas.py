@@ -135,3 +135,7 @@ class ProjectChatStreamRequest(BaseModel):
     top_k: int = 6
     filter_doc_type: str = ""
     filter_source_file: str = ""
+    # 问答模式：方舟原生 web_search 工具（需模型/接入点支持联网）
+    enable_native_web_search: bool = False
+    # 问答模式：自行检索后粘贴的摘录；非空时优先用「摘录+问题」提示，不再传 web_search 工具
+    web_paste_context: str = Field(default="", max_length=16000)

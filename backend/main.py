@@ -48,6 +48,7 @@ from fastapi.responses import FileResponse, PlainTextResponse, Response, Streami
 from openai import OpenAI
 from sqlmodel import select
 from dotenv import load_dotenv
+import requests
 
 from .chunking import chunk_text
 from .metadata_extract import evidence_chunk_metadata
@@ -1134,6 +1135,305 @@ def sse_event(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+# 降低代理/Nginx 缓冲 SSE 导致前端长时间看不到分片
+SSE_STREAM_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+SSE_MEDIA_TYPE = "text/event-stream; charset=utf-8"
+
+# 方舟 Chat Completions 联网：须为 OpenAI 形态 tools[].function；工具项上勿加额外字段（易被校验拒绝）
+ARK_WEB_SEARCH_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "在互联网上检索与问题相关的最新公开信息。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
+
+ARK_WEB_SEARCH_EMPTY_HINT = (
+    "（联网模式未收到可展示的正文：请确认接入点已开启联网能力，"
+    "或改用「自行检索摘录」粘贴资料后再问。）"
+)
+
+
+_QA_ANSWER_BEGIN_RE = re.compile(r"<<<\s*LAWLAW_ANSWER\s*>>>", re.IGNORECASE)
+_QA_ANSWER_END_RE = re.compile(r"<<<\s*END_LAWLAW_ANSWER\s*>>>", re.IGNORECASE)
+
+_QA_FORMAT_INSTRUCTION = (
+    "【输出格式（必须严格遵守）】\n"
+    "除下列两行分隔符及其之间的正文外，不要输出任何其他字符（不要输出思考过程、不要自问自答、"
+    "不要解释你要调用什么工具、不要出现 web_search 等字样）。\n"
+    "第一行必须恰好为：<<<LAWLAW_ANSWER>>>\n"
+    "最后一行必须恰好为：<<<END_LAWLAW_ANSWER>>>\n"
+    "中间仅写面向用户的最终回答，可使用 Markdown；若依据来自互联网公开检索，请在正文内简要说明来源性质即可。"
+)
+
+
+def _qa_strip_tool_and_think_tags(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+    t = re.sub(r"</?seed:[^>]*>", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"seed:tool_call[^\n\r]*", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"<think>.*?</think>", " ", t, flags=re.IGNORECASE | re.DOTALL)
+    t = re.sub(r"【\s*(思考|推理|推断)\s*】", " ", t, flags=re.IGNORECASE)
+    t = re.sub(
+        r"(思考过程|推理过程|推断)[:：]\s*",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    return t.strip()
+
+
+def _qa_fallback_strip_meta_lines(text: str) -> str:
+    """未出现分隔符时，尽量删掉典型的内心独白行（启发式，可能误伤，优先靠格式约束）。"""
+    drop_prefixes = (
+        "用户现在",
+        "首先按照",
+        "首先，",
+        "首先 ",
+        "要先调用",
+        "需要调用",
+        "所以先",
+        "按照要求",
+        "不对不对",
+        "哦不对",
+        "哦对",
+        "等下",
+        "等一下",
+        "对吧",
+        "对不对",
+        "要不要输出",
+        "思考过程",
+        "推理过程",
+    )
+    lines_out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            lines_out.append(line)
+            continue
+        if any(s.startswith(p) for p in drop_prefixes):
+            continue
+        low = s.lower()
+        if "web_search" in low or "tool_call" in low:
+            continue
+        if re.match(r"^(不对|对，|对。|嗯|呃|哦)", s):
+            continue
+        lines_out.append(line)
+    out = "\n".join(lines_out).strip()
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out
+
+
+def _extract_qa_answer(text: str) -> str:
+    """从问答模型输出中取出用户可见正文：优先解析 LAWLAW 分隔符，否则启发式去噪。"""
+    t = _qa_strip_tool_and_think_tags(text)
+    if not t:
+        return ""
+    # 模型有时只输出结尾分隔符或把 END 粘在正文后，先去掉尾部 END 再解析
+    t = re.sub(r"<<<\s*END_LAWLAW_ANSWER\s*>>>\s*$", "", t, flags=re.IGNORECASE | re.MULTILINE).strip()
+    b = _QA_ANSWER_BEGIN_RE.search(t)
+    if b:
+        e = _QA_ANSWER_END_RE.search(t, b.end())
+        if e:
+            inner = t[b.end() : e.start()].strip()
+        else:
+            inner = t[b.end() :].strip()
+        if inner:
+            return re.sub(
+                r"<<<\s*END_LAWLAW_ANSWER\s*>>>\s*$",
+                "",
+                inner,
+                flags=re.IGNORECASE | re.MULTILINE,
+            ).strip()
+    return _qa_fallback_strip_meta_lines(t)
+
+
+def _iter_response_utf8_lines(resp: requests.Response) -> Iterable[str]:
+    """按 \\n 切分后再 UTF-8 解码整行，避免 iter_lines 在 TCP 分包边界拆开多字节字符导致 JSON 解析失败。"""
+    buf = b""
+    for chunk in resp.iter_content(chunk_size=65536):
+        if not chunk:
+            continue
+        buf += chunk
+        while True:
+            nl = buf.find(b"\n")
+            if nl == -1:
+                break
+            raw = buf[:nl]
+            buf = buf[nl + 1:]
+            if raw.endswith(b"\r"):
+                raw = raw[:-1]
+            if not raw:
+                continue
+            yield raw.decode("utf-8", errors="replace")
+    if buf.strip():
+        yield buf.decode("utf-8", errors="replace")
+
+
+def _ark_normalize_message_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                t = item.get("type")
+                if t in ("text", "input_text") and item.get("text") is not None:
+                    parts.append(str(item.get("text") or ""))
+                elif item.get("text") is not None:
+                    parts.append(str(item.get("text") or ""))
+        return "".join(parts)
+    return str(content)
+
+
+def _ark_stream_text_piece_from_choice(choice: dict[str, Any]) -> str:
+    delta = choice.get("delta")
+    if not isinstance(delta, dict):
+        delta = {}
+    parts: list[str] = []
+    parts.append(_ark_normalize_message_content(delta.get("content")))
+    # 一些接入点会把“最终答案”也放在 reasoning_content/reasoning 中；
+    # 上层会对整段输出做 _extract_qa_answer 解析。
+    for key in ("reasoning_content", "reasoning"):
+        r = delta.get(key)
+        if isinstance(r, str) and r.strip():
+            parts.append(r)
+    msg = choice.get("message")
+    if isinstance(msg, dict):
+        parts.append(_ark_normalize_message_content(msg.get("content")))
+    return "".join(parts)
+
+
+def _ark_chat_completions_body(
+    *,
+    chat_id: str,
+    messages: list[dict[str, str]],
+    temperature: float,
+    stream: bool,
+    tools: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "model": chat_id,
+        "messages": messages,
+        "stream": stream,
+        "temperature": temperature,
+    }
+    if tools is not None:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+        body["max_tokens"] = 4096
+    return body
+
+
+def _iter_ark_chat_completion_sse_text_chunks(
+    *,
+    api_key: str,
+    chat_id: str,
+    messages: list[dict[str, str]],
+    temperature: float,
+    tools: list[dict[str, Any]] | None,
+) -> Iterable[str]:
+    """直连方舟 Chat Completions 流式接口，避免 OpenAI SDK 改写/丢弃 tools 字段。"""
+    url = f"{DOUBAO_BASE_URL.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body = _ark_chat_completions_body(
+        chat_id=chat_id,
+        messages=messages,
+        temperature=temperature,
+        stream=True,
+        tools=tools,
+    )
+    yielded = False
+    with requests.post(
+        url,
+        headers=headers,
+        json=body,
+        stream=True,
+        timeout=(60, 600),
+    ) as resp:
+        if resp.status_code >= 400:
+            try:
+                detail = resp.text[:1200]
+            except Exception:
+                detail = str(resp.status_code)
+            raise RuntimeError(f"方舟请求失败（{resp.status_code}）：{detail[:500]}")
+        for raw_line in _iter_response_utf8_lines(resp):
+            line = raw_line.strip()
+            if line == "data: [DONE]":
+                break
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:].strip()
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            err = obj.get("error")
+            if err:
+                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                raise RuntimeError(msg)
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            piece = _ark_stream_text_piece_from_choice(choices[0])
+            if piece:
+                yielded = True
+                yield piece
+
+    if tools is not None and not yielded:
+        fb = _ark_chat_completions_body(
+            chat_id=chat_id,
+            messages=messages,
+            temperature=temperature,
+            stream=False,
+            tools=tools,
+        )
+        r = requests.post(url, headers=headers, json=fb, timeout=(60, 600))
+        if r.status_code >= 400:
+            try:
+                detail = r.text[:1200]
+            except Exception:
+                detail = str(r.status_code)
+            raise RuntimeError(f"方舟请求失败（{r.status_code}）：{detail[:500]}")
+        try:
+            data = r.json()
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"方舟返回非 JSON：{exc}") from exc
+        err = data.get("error")
+        if err:
+            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            raise RuntimeError(msg)
+        choices = data.get("choices") or []
+        if not choices:
+            yield ARK_WEB_SEARCH_EMPTY_HINT
+            return
+        msg = choices[0].get("message")
+        if not isinstance(msg, dict):
+            yield ARK_WEB_SEARCH_EMPTY_HINT
+            return
+        final = _ark_normalize_message_content(msg.get("content"))
+        if final.strip():
+            yield final
+        else:
+            yield ARK_WEB_SEARCH_EMPTY_HINT
+
+
 def _truncate_for_chat_context(text: str, max_chars: int = CHAT_DOCUMENT_MARKDOWN_MAX) -> str:
     t = text or ""
     if len(t) <= max_chars:
@@ -1147,12 +1447,19 @@ def _chat_history_openai_messages(history: Any) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     seq = history if isinstance(history, list) else []
     for item in seq[-20:]:
-        if not isinstance(item, ProjectChatHistoryItem):
+        if isinstance(item, ProjectChatHistoryItem):
+            p = item
+        elif isinstance(item, dict):
+            try:
+                p = ProjectChatHistoryItem.model_validate(item)
+            except Exception:
+                continue
+        else:
             continue
-        role = (item.role or "").strip().lower()
+        role = (p.role or "").strip().lower()
         if role not in ("user", "assistant"):
             continue
-        content = (item.content or "").strip()
+        content = (p.content or "").strip()
         if not content:
             continue
         out.append({"role": role, "content": content})
@@ -1368,27 +1675,6 @@ def resolve_api_key(request_value: str | None = None) -> str:
     return (request_value or "").strip() or (os.getenv("ARK_API_KEY") or "").strip()
 
 
-def debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
-    # #region agent log
-    try:
-        log_path = Path(__file__).resolve().parent.parent / ".cursor" / "debug-0a12b2.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "sessionId": "0a12b2",
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-        }
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-    # #endregion
-
-
 @app.get("/api/config-check")
 def config_check() -> dict[str, Any]:
     ark_api_key = (os.getenv("ARK_API_KEY") or "").strip()
@@ -1454,22 +1740,6 @@ def model_options() -> dict[str, Any]:
 
 @app.post("/api/model-probe")
 def model_probe(payload: ModelProbeRequest) -> dict[str, Any]:
-    run_id = f"probe-{int(datetime.now(timezone.utc).timestamp() * 1000)}"
-    # #region agent log
-    debug_log(
-        run_id,
-        "H1",
-        "backend/main.py:model_probe:start",
-        "model_probe request received",
-        {
-            "has_request_api_key": bool((payload.api_key or "").strip()),
-            "request_chat_endpoint": (payload.chat_vision_endpoint_id or "").strip(),
-            "request_embedding_endpoint": (payload.embedding_endpoint_id or "").strip(),
-            "request_chat_legacy": (payload.chat_vision_model_id or "").strip(),
-            "request_embedding_legacy": (payload.embedding_model_id or "").strip(),
-        },
-    )
-    # #endregion
     api_key = resolve_api_key(payload.api_key)
     if not api_key:
         raise HTTPException(status_code=400, detail="缺少 API Key，请在齿轮填写或在 backend/.env 配置 ARK_API_KEY")
@@ -1492,20 +1762,6 @@ def model_probe(payload: ModelProbeRequest) -> dict[str, Any]:
             status_code=400,
             detail="缺少 Embedding 接入点 ID（请求体或 .env 均未配置）。",
         )
-    # #region agent log
-    debug_log(
-        run_id,
-        "H2",
-        "backend/main.py:model_probe:resolved-config",
-        "resolved probe config",
-        {
-            "api_key_len": len(api_key),
-            "api_key_from_request": bool((payload.api_key or "").strip()),
-            "chat_model_id": chat_model_id,
-            "embedding_model_id": embedding_model_id,
-        },
-    )
-    # #endregion
     client = OpenAI(base_url=DOUBAO_BASE_URL, api_key=api_key)
 
     embedding_ok = False
@@ -1526,18 +1782,6 @@ def model_probe(payload: ModelProbeRequest) -> dict[str, Any]:
             "model_probe Embedding 探测失败（详情已写入响应 embedding.error）：%s",
             embedding_error[:2000],
         )
-        # #region agent log
-        debug_log(
-            run_id,
-            "H3",
-            "backend/main.py:model_probe:embedding-error",
-            "embedding probe failed",
-            {
-                "embedding_model_id": embedding_model_id,
-                "error": embedding_error[:300],
-            },
-        )
-        # #endregion
 
     try:
         client.chat.completions.create(
@@ -1549,32 +1793,7 @@ def model_probe(payload: ModelProbeRequest) -> dict[str, Any]:
         chat_ok = True
     except Exception as exc:
         chat_error = str(exc)
-        # #region agent log
-        debug_log(
-            run_id,
-            "H4",
-            "backend/main.py:model_probe:chat-error",
-            "chat probe failed",
-            {
-                "chat_model_id": chat_model_id,
-                "error": chat_error[:300],
-            },
-        )
-        # #endregion
 
-    # #region agent log
-    debug_log(
-        run_id,
-        "H5",
-        "backend/main.py:model_probe:result",
-        "model_probe finished",
-        {
-            "ok": embedding_ok and chat_ok,
-            "embedding_ok": embedding_ok,
-            "chat_ok": chat_ok,
-        },
-    )
-    # #endregion
     return {
         "ok": embedding_ok and chat_ok,
         "embedding": {
@@ -2218,7 +2437,7 @@ def ocr_rebuild_endpoint(project_id: int, payload: OcrRebuildRequest) -> dict[st
             except Exception as exc:
                 yield sse_event({"type": "error", "message": str(exc)})
 
-        return StreamingResponse(sse_gen(), media_type="text/event-stream")
+        return StreamingResponse(sse_gen(), media_type=SSE_MEDIA_TYPE)
 
     steps = list(
         _iter_ocr_rebuild_steps(
@@ -2348,7 +2567,7 @@ async def generate_legal_opinion(payload: GenerateRequest) -> StreamingResponse:
             user_instruction_text=instruction,
             extra_history=None,
         ),
-        media_type="text/event-stream",
+        media_type=SSE_MEDIA_TYPE,
     )
 
 
@@ -2432,7 +2651,7 @@ async def rag_query(payload: RagQueryRequest) -> RagQueryResponse:
 
 @app.post("/api/rag-query/stream")
 async def rag_query_stream(payload: RagQueryRequest) -> StreamingResponse:
-    return StreamingResponse(iter_rag_query_sse(payload), media_type="text/event-stream")
+    return StreamingResponse(iter_rag_query_sse(payload), media_type=SSE_MEDIA_TYPE)
 
 
 def _rag_payload_from_project_chat(project_id: int, p: ProjectChatStreamRequest) -> RagQueryRequest:
@@ -2497,28 +2716,70 @@ def iter_project_chat_sse(project_id: int, payload: ProjectChatStreamRequest) ->
     client = OpenAI(base_url=DOUBAO_BASE_URL, api_key=api_key)
 
     if mode == ChatStreamMode.qa:
-        system_prompt = (
-            "你是专业法律顾问。请结合多轮对话回答用户问题，语气专业、简洁。"
-            "不要编造具体案例或法条条文；若不确定请明确说明。"
-        )
-        messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}, *hist, {"role": "user", "content": message}]
+        paste = (payload.web_paste_context or "").strip()
+        use_native_web = bool(payload.enable_native_web_search) and not paste
+        # 仅「方舟原生联网」路径使用分隔符与整段解析；普通问答与自行摘录不走该约束。
+        if paste:
+            system_prompt = (
+                "你是专业法律顾问。请根据用户给出的「实时网络资料」与问题作答，语气专业、简洁。"
+                "优先采信摘录中的事实；摘录不足时说明局限。"
+                "不要编造摘录中未出现的案例或法条原文；若不确定请明确说明。"
+            )
+            user_body = f"问题：{message}\n\n实时网络资料：\n{paste}"
+        elif use_native_web:
+            system_prompt = (
+                "你是专业法律顾问。当前已启用火山方舟联网检索（web_search 工具由平台侧执行）："
+                "回答须基于检索可见的互联网公开信息；若无结果或不可靠须如实说明，勿编造。"
+                "勿将项目内上传文档当作本次联网检索结果。\n"
+                + _QA_FORMAT_INSTRUCTION
+            )
+            user_body = (
+                f"{message}\n\n"
+                "（请严格按系统指定的分隔符输出：第一行 <<<LAWLAW_ANSWER>>>，"
+                "最后一行 <<<END_LAWLAW_ANSWER>>>，中间仅为用户可见正文；不要输出其它任何字符。）"
+            )
+        else:
+            system_prompt = (
+                "你是专业法律顾问。请结合多轮对话回答用户问题，语气专业、简洁。"
+                "不要编造具体案例或法条条文；若不确定请明确说明。"
+            )
+            user_body = message
+        messages = [{"role": "system", "content": system_prompt}, *hist, {"role": "user", "content": user_body}]
 
         try:
-            stream = client.chat.completions.create(
-                model=chat_id,
-                messages=messages,
-                stream=True,
-                temperature=0.45,
-            )
-            for chunk in stream:
-                delta = ""
-                if chunk.choices and chunk.choices[0].delta:
-                    delta = chunk.choices[0].delta.content or ""
-                if delta:
-                    yield sse_event({"type": "delta", "content": delta})
+            if use_native_web:
+                assembled: list[str] = []
+                for piece in _iter_ark_chat_completion_sse_text_chunks(
+                    api_key=api_key,
+                    chat_id=chat_id,
+                    messages=messages,
+                    temperature=0.35,
+                    tools=ARK_WEB_SEARCH_TOOLS,
+                ):
+                    assembled.append(piece)
+                final_text = _extract_qa_answer("".join(assembled))
+                if final_text:
+                    yield sse_event({"type": "delta", "content": final_text})
+                else:
+                    yield sse_event({"type": "delta", "content": ARK_WEB_SEARCH_EMPTY_HINT})
+            else:
+                stream = client.chat.completions.create(
+                    model=chat_id,
+                    messages=messages,
+                    stream=True,
+                    temperature=0.45,
+                )
+                for chunk in stream:
+                    delta = ""
+                    if chunk.choices and chunk.choices[0].delta:
+                        d = chunk.choices[0].delta
+                        delta = (d.content or "") if d.content is not None else ""
+                    if delta:
+                        yield sse_event({"type": "delta", "content": delta})
             yield sse_event({"type": "done", "sources": []})
         except Exception as exc:
             yield sse_event({"type": "error", "message": str(exc)})
+            yield sse_event({"type": "done", "sources": []})
         return
 
     if mode == ChatStreamMode.full_rewrite:
@@ -2559,12 +2820,14 @@ def iter_project_chat_sse(project_id: int, payload: ProjectChatStreamRequest) ->
             for chunk in stream:
                 delta = ""
                 if chunk.choices and chunk.choices[0].delta:
-                    delta = chunk.choices[0].delta.content or ""
+                    d = chunk.choices[0].delta
+                    delta = (d.content or "") if d.content is not None else ""
                 if delta:
                     yield sse_event({"type": "delta", "content": delta})
             yield sse_event({"type": "done", "sources": []})
         except Exception as exc:
             yield sse_event({"type": "error", "message": str(exc)})
+            yield sse_event({"type": "done", "sources": []})
         return
 
     yield sse_event({"type": "error", "message": f"unknown chat mode: {mode}"})
@@ -2573,4 +2836,8 @@ def iter_project_chat_sse(project_id: int, payload: ProjectChatStreamRequest) ->
 
 @app.post("/api/projects/{project_id}/chat/stream")
 async def project_chat_stream(project_id: int, payload: ProjectChatStreamRequest) -> StreamingResponse:
-    return StreamingResponse(iter_project_chat_sse(project_id, payload), media_type="text/event-stream")
+    return StreamingResponse(
+        iter_project_chat_sse(project_id, payload),
+        media_type=SSE_MEDIA_TYPE,
+        headers=dict(SSE_STREAM_HEADERS),
+    )

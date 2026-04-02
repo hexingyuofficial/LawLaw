@@ -9,10 +9,14 @@ import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { CitationPill } from "@/components/workspace/citation-pill";
-import { getBackendApiUrl } from "@/lib/backend-url";
+import { getBackendApiUrl, getBackendSseUrl } from "@/lib/backend-url";
 import { readArkSettingsFromStorage } from "@/lib/ark-settings";
 import { type EditorRewriteHandle } from "@/components/workspace/editor-panel";
 import { extractDocCitations, stripTrailingSourcesBlock } from "@/lib/citation-parse";
+import {
+  readQaNativeWebSearchFromStorage,
+  writeQaNativeWebSearchToStorage,
+} from "@/lib/chat-ui-settings";
 
 /** 若模型用 ``` 围栏包住整篇 Markdown，去掉围栏再写入编辑器 */
 function stripOptionalMarkdownFence(s: string): string {
@@ -55,6 +59,81 @@ const CHAT_MODES: { value: ChatMode; label: string }[] = [
   { value: "qa", label: "问答" },
 ];
 
+const QA_ANS_BEGIN_RE = /<<<\s*LAWLAW_ANSWER\s*>>>/i;
+const QA_ANS_END_RE = /<<<\s*END_LAWLAW_ANSWER\s*>>>/i;
+
+function stripQaToolTags(text: string): string {
+  let t = (text ?? "").trim();
+  if (!t) return "";
+  t = t.replace(/<\/?seed:[^>]*>/gi, " ");
+  t = t.replace(/seed:tool_call[^\n\r]*/gi, " ");
+  t = t.replace(/<think>.*?<\/think>/gis, " ");
+  t = t.replace(/【\s*(思考|推理|推断)\s*】/g, " ");
+  t = t.replace(/(思考过程|推理过程|推断)[:：]\s*/gi, "");
+  return t.trim();
+}
+
+const QA_META_LINE_PREFIXES = [
+  "用户现在",
+  "首先按照",
+  "首先，",
+  "首先 ",
+  "要先调用",
+  "需要调用",
+  "所以先",
+  "按照要求",
+  "不对不对",
+  "哦不对",
+  "哦对",
+  "等下",
+  "等一下",
+  "对吧",
+  "对不对",
+  "要不要输出",
+  "思考过程",
+  "推理过程",
+];
+
+function qaFallbackStripMetaLines(text: string): string {
+  const lines = text.split("\n");
+  const out: string[] = [];
+  for (const line of lines) {
+    const s = line.trim();
+    if (!s) {
+      out.push(line);
+      continue;
+    }
+    if (QA_META_LINE_PREFIXES.some((p) => s.startsWith(p))) continue;
+    const low = s.toLowerCase();
+    if (low.includes("web_search") || low.includes("tool_call")) continue;
+    if (/^(不对|对，|对。|嗯|呃|哦)/.test(s)) continue;
+    out.push(line);
+  }
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/** 与后端 _extract_qa_answer 对齐：优先解析分隔符，否则启发式去内心独白行 */
+function extractQaAnswerForDisplay(text: string): string {
+  let t = stripQaToolTags(text);
+  if (!t) return "";
+  t = t.replace(/<<<\s*END_LAWLAW_ANSWER\s*>>>\s*$/gim, "").trim();
+  QA_ANS_BEGIN_RE.lastIndex = 0;
+  const beginM = QA_ANS_BEGIN_RE.exec(t);
+  if (beginM?.index !== undefined) {
+    const afterBegin = t.slice(beginM.index + beginM[0].length);
+    QA_ANS_END_RE.lastIndex = 0;
+    const endM = QA_ANS_END_RE.exec(afterBegin);
+    if (endM?.index !== undefined) {
+      return afterBegin
+        .slice(0, endM.index)
+        .replace(/<<<\s*END_LAWLAW_ANSWER\s*>>>\s*$/gim, "")
+        .trim();
+    }
+    return afterBegin.replace(/<<<\s*END_LAWLAW_ANSWER\s*>>>\s*$/gim, "").trim();
+  }
+  return qaFallbackStripMetaLines(t);
+}
+
 type WorkspaceChatPanelProps = {
   projectId?: number | null;
   documentMarkdown?: string;
@@ -79,9 +158,13 @@ export function WorkspaceChatPanel({
   const [streamStatus, setStreamStatus] = useState("");
   const [loadingState, setLoadingState] = useState(false);
   const [quoteActionHint, setQuoteActionHint] = useState("");
+  const [qaNativeWebSearch, setQaNativeWebSearch] = useState(false);
+  const [qaWebPasteContext, setQaWebPasteContext] = useState("");
   const activeStreamAbortRef = useRef<AbortController | null>(null);
   const stateLoadingAbortRef = useRef<AbortController | null>(null);
   const projectIdRef = useRef<number | null | undefined>(projectId);
+  /** 仅「问答 + 勾选联网搜索」为 true，用于与「普通问答/自行摘录」分支隔离展示逻辑 */
+  const lastQaNativeWebRef = useRef(false);
 
   const persistMessage = async (targetProjectId: number, role: "user" | "assistant", content: string) => {
     await fetch(getBackendApiUrl(`/api/projects/${targetProjectId}/messages`), {
@@ -94,6 +177,10 @@ export function WorkspaceChatPanel({
   useEffect(() => {
     projectIdRef.current = projectId;
   }, [projectId]);
+
+  useEffect(() => {
+    setQaNativeWebSearch(readQaNativeWebSearchFromStorage());
+  }, []);
 
   useEffect(() => {
     if (activeStreamAbortRef.current) {
@@ -188,6 +275,10 @@ export function WorkspaceChatPanel({
       setComposeError("局部改写需要先在正文中选中内容，再点击上方「引用到对话」。");
       return;
     }
+    if (chatMode === "qa" && qaWebPasteContext.length > 16000) {
+      setComposeError("自行检索摘录过长，请删减至 16000 字以内。");
+      return;
+    }
     setComposeError("");
 
     setAsking(true);
@@ -217,13 +308,19 @@ export function WorkspaceChatPanel({
 
       const streamController = new AbortController();
       activeStreamAbortRef.current = streamController;
+      lastQaNativeWebRef.current =
+        chatMode === "qa" && qaNativeWebSearch && !qaWebPasteContext.trim();
       streamAssistantId = `a-${Date.now()}`;
       const assistantPlaceholder =
         chatMode === "full_rewrite"
           ? "正在重写全文…"
           : chatMode === "partial_rewrite"
             ? "正在重写选区…"
-            : "";
+            : chatMode === "search"
+              ? "正在检索资料并生成回答…"
+              : chatMode === "qa"
+                ? "正在生成回答…"
+                : "";
       setMessages((prev) => [
         ...prev,
         { id: streamAssistantId!, role: "assistant", content: assistantPlaceholder },
@@ -234,7 +331,7 @@ export function WorkspaceChatPanel({
         : undefined;
 
       const response = await fetch(
-        getBackendApiUrl(`/api/projects/${requestProjectId}/chat/stream`),
+        getBackendSseUrl(`/api/projects/${requestProjectId}/chat/stream`),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -250,6 +347,8 @@ export function WorkspaceChatPanel({
             chat_vision_endpoint_id: ark.chat_vision_endpoint_id,
             embedding_endpoint_id: ark.embedding_endpoint_id,
             top_k: 6,
+            enable_native_web_search: chatMode === "qa" && qaNativeWebSearch,
+            web_paste_context: chatMode === "qa" ? qaWebPasteContext.trim() : "",
           }),
         },
       );
@@ -275,122 +374,146 @@ export function WorkspaceChatPanel({
       let answer = "";
       let sources: string[] = [];
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          break;
+      const handleSseBlock = (block: string) => {
+        const dataLine = block
+          .split("\n")
+          .map((line) => line.trim())
+          .find((line) => line.startsWith("data:"));
+        if (!dataLine) {
+          return;
         }
-        sseBuffer += decoder.decode(value, { stream: true });
+        const raw = dataLine.replace(/^data:\s*/, "");
+        let event: ChatStreamEvent;
+        try {
+          event = JSON.parse(raw) as ChatStreamEvent;
+        } catch {
+          return;
+        }
 
+        if (event.type === "sources") {
+          sources = event.sources ?? [];
+        } else if (event.type === "hint") {
+          if (chatMode === "full_rewrite" && event.message) {
+            setStreamStatus(event.message);
+          }
+        } else if (event.type === "progress") {
+          if (chatMode === "full_rewrite" && event.message) {
+            setStreamStatus(event.message);
+          }
+        } else if (event.type === "delta") {
+          if (projectIdRef.current !== requestProjectId) {
+            streamController.abort();
+            return;
+          }
+          answer += event.content ?? "";
+          if (chatMode !== "full_rewrite" && chatMode !== "partial_rewrite") {
+            if (chatMode === "qa" && lastQaNativeWebRef.current) {
+              // 仅方舟联网：整段返回后再解析，避免思考过程流式露出
+              return;
+            }
+            setMessages((prev) =>
+              prev.map((msg) =>
+                msg.id === streamAssistantId ? { ...msg, content: answer } : msg,
+              ),
+            );
+          }
+        } else if (event.type === "error") {
+          throw new Error(event.message || "流式对话失败");
+        } else if (event.type === "done") {
+          if (projectIdRef.current !== requestProjectId) {
+            streamController.abort();
+            return;
+          }
+          if (chatMode === "full_rewrite" || chatMode === "partial_rewrite") {
+            const cleaned = stripOptionalMarkdownFence(answer.trim());
+            if (!cleaned) {
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === streamAssistantId
+                    ? { ...msg, content: "[错误] 模型未返回有效正文。" }
+                    : msg,
+                ),
+              );
+            } else {
+              try {
+                const ed = editorRewriteRef?.current;
+                if (!ed) {
+                  throw new Error("编辑器未就绪，请稍后再试。");
+                }
+                if (chatMode === "full_rewrite") {
+                  ed.applyFullRewriteMarkdown(cleaned);
+                  setStreamStatus("");
+                  setMessages((prev) =>
+                    prev.map((msg) =>
+                      msg.id === streamAssistantId ? { ...msg, content: "已重写完毕" } : msg,
+                    ),
+                  );
+                  void persistMessage(requestProjectId, "assistant", "已重写完毕");
+                } else {
+                  ed.applyPartialRewriteMarkdown(cleaned, partialSelectionSnapshot?.text ?? "");
+                  setStreamStatus("");
+                  const partialAssistantContent = `### 改写结果（已写入正文）\n\n${cleaned}`;
+                  setMessages((prev) =>
+                    prev.map((msg) =>
+                      msg.id === streamAssistantId
+                        ? { ...msg, content: partialAssistantContent }
+                        : msg,
+                    ),
+                  );
+                  void persistMessage(requestProjectId, "assistant", partialAssistantContent);
+                  onClearEditorSelection?.();
+                }
+              } catch (rewriteErr) {
+                const msg =
+                  rewriteErr instanceof Error ? rewriteErr.message : "改写写回失败，请稍后重试。";
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === streamAssistantId ? { ...m, content: `[错误] ${msg}` } : m,
+                  ),
+                );
+              }
+            }
+          } else {
+            const finalSources = event.sources?.length ? event.sources : sources;
+            const sourceLine =
+              chatMode === "search" && finalSources.length > 0
+                ? `\n\n来源：${finalSources.map((s) => `[doc:${s}]`).join(" ")}`
+                : "";
+            let finalContent = `${answer}${sourceLine}`;
+            if (chatMode === "qa" && lastQaNativeWebRef.current) {
+              const display = extractQaAnswerForDisplay(answer);
+              finalContent = (display || answer).trim() + sourceLine;
+            }
+            setMessages((prev) =>
+              prev.map((msg) =>
+                msg.id === streamAssistantId ? { ...msg, content: finalContent } : msg,
+              ),
+            );
+            void persistMessage(requestProjectId, "assistant", finalContent);
+          }
+        }
+      };
+
+      const drainSseBuffer = () => {
         let boundary = sseBuffer.indexOf("\n\n");
         while (boundary !== -1) {
           const block = sseBuffer.slice(0, boundary);
           sseBuffer = sseBuffer.slice(boundary + 2);
-
-          const dataLine = block
-            .split("\n")
-            .map((line) => line.trim())
-            .find((line) => line.startsWith("data:"));
-          if (dataLine) {
-            const raw = dataLine.replace(/^data:\s*/, "");
-            const event = JSON.parse(raw) as ChatStreamEvent;
-
-            if (event.type === "sources") {
-              sources = event.sources ?? [];
-            } else if (event.type === "hint") {
-              if (chatMode === "full_rewrite" && event.message) {
-                setStreamStatus(event.message);
-              }
-            } else if (event.type === "progress") {
-              if (chatMode === "full_rewrite" && event.message) {
-                setStreamStatus(event.message);
-              }
-            } else if (event.type === "delta") {
-              if (projectIdRef.current !== requestProjectId) {
-                streamController.abort();
-                break;
-              }
-              answer += event.content ?? "";
-              if (chatMode !== "full_rewrite" && chatMode !== "partial_rewrite") {
-                setMessages((prev) =>
-                  prev.map((msg) =>
-                    msg.id === streamAssistantId ? { ...msg, content: answer } : msg,
-                  ),
-                );
-              }
-            } else if (event.type === "error") {
-              throw new Error(event.message || "流式对话失败");
-            } else if (event.type === "done") {
-              if (projectIdRef.current !== requestProjectId) {
-                streamController.abort();
-                break;
-              }
-              if (chatMode === "full_rewrite" || chatMode === "partial_rewrite") {
-                const cleaned = stripOptionalMarkdownFence(answer.trim());
-                if (!cleaned) {
-                  setMessages((prev) =>
-                    prev.map((msg) =>
-                      msg.id === streamAssistantId
-                        ? { ...msg, content: "[错误] 模型未返回有效正文。" }
-                        : msg,
-                    ),
-                  );
-                } else {
-                  try {
-                    const ed = editorRewriteRef?.current;
-                    if (!ed) {
-                      throw new Error("编辑器未就绪，请稍后再试。");
-                    }
-                    if (chatMode === "full_rewrite") {
-                      ed.applyFullRewriteMarkdown(cleaned);
-                      setStreamStatus("");
-                      setMessages((prev) =>
-                        prev.map((msg) =>
-                          msg.id === streamAssistantId ? { ...msg, content: "已重写完毕" } : msg,
-                        ),
-                      );
-                      void persistMessage(requestProjectId, "assistant", "已重写完毕");
-                    } else {
-                      ed.applyPartialRewriteMarkdown(cleaned, partialSelectionSnapshot?.text ?? "");
-                      setStreamStatus("");
-                      const partialAssistantContent = `### 改写结果（已写入正文）\n\n${cleaned}`;
-                      setMessages((prev) =>
-                        prev.map((msg) =>
-                          msg.id === streamAssistantId
-                            ? { ...msg, content: partialAssistantContent }
-                            : msg,
-                        ),
-                      );
-                      void persistMessage(requestProjectId, "assistant", partialAssistantContent);
-                      onClearEditorSelection?.();
-                    }
-                  } catch (rewriteErr) {
-                    const msg =
-                      rewriteErr instanceof Error ? rewriteErr.message : "改写写回失败，请稍后重试。";
-                    setMessages((prev) =>
-                      prev.map((m) =>
-                        m.id === streamAssistantId ? { ...m, content: `[错误] ${msg}` } : m,
-                      ),
-                    );
-                  }
-                }
-              } else {
-                const finalSources = event.sources?.length ? event.sources : sources;
-                const sourceLine =
-                  chatMode === "search" && finalSources.length > 0
-                    ? `\n\n来源：${finalSources.map((s) => `[doc:${s}]`).join(" ")}`
-                    : "";
-                const finalContent = `${answer}${sourceLine}`;
-                setMessages((prev) =>
-                  prev.map((msg) =>
-                    msg.id === streamAssistantId ? { ...msg, content: finalContent } : msg,
-                  ),
-                );
-                void persistMessage(requestProjectId, "assistant", finalContent);
-              }
-            }
-          }
+          handleSseBlock(block);
           boundary = sseBuffer.indexOf("\n\n");
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (value && value.byteLength > 0) {
+          sseBuffer += decoder.decode(value, { stream: true });
+        }
+        drainSseBuffer();
+        if (done) {
+          sseBuffer += decoder.decode();
+          drainSseBuffer();
+          break;
         }
       }
     } catch (error) {
@@ -424,9 +547,27 @@ export function WorkspaceChatPanel({
   return (
     <div className="flex h-full min-h-0 w-full flex-col bg-white">
       <div className="shrink-0 border-b border-zinc-200 px-3 py-2">
-        <div className="flex items-center gap-2 text-sm font-semibold text-zinc-700">
-          <MessageSquare className="h-4 w-4 shrink-0" />
-          AI 对话
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-sm font-semibold text-zinc-700">
+            <MessageSquare className="h-4 w-4 shrink-0" />
+            AI 对话
+          </div>
+          {chatMode === "qa" ? (
+            <label className="flex cursor-pointer select-none items-center gap-1.5 text-[11px] text-zinc-600">
+              <input
+                type="checkbox"
+                className="h-3.5 w-3.5 rounded border-zinc-300"
+                checked={qaNativeWebSearch}
+                disabled={asking || !!qaWebPasteContext.trim()}
+                onChange={(e) => {
+                  const v = e.target.checked;
+                  setQaNativeWebSearch(v);
+                  writeQaNativeWebSearchToStorage(v);
+                }}
+              />
+              <span title="调用方舟 web_search 工具，需接入点支持联网">联网搜索</span>
+            </label>
+          ) : null}
         </div>
         <div className="mt-2 flex flex-wrap items-center gap-1.5">
           {CHAT_MODES.map((m) => (
@@ -449,6 +590,22 @@ export function WorkspaceChatPanel({
             </button>
           ))}
         </div>
+        {chatMode === "qa" ? (
+          <div className="mt-2 space-y-1">
+            <p className="text-[10px] leading-snug text-zinc-500">
+              自行检索摘录（可选）：粘贴网页要点后，将不走方舟联网工具、由模型仅根据摘录作答。
+            </p>
+            <textarea
+              className="min-h-[52px] w-full resize-y rounded-md border border-zinc-200 bg-white px-2 py-1.5 text-[11px] text-zinc-800 placeholder:text-zinc-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-300"
+              placeholder="选填：自行搜索后粘贴摘要（与上方「联网搜索」二选一）"
+              rows={2}
+              maxLength={16000}
+              disabled={asking}
+              value={qaWebPasteContext}
+              onChange={(e) => setQaWebPasteContext(e.target.value)}
+            />
+          </div>
+        ) : null}
       </div>
 
       {streamStatus.trim() ? (

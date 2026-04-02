@@ -14,6 +14,7 @@ import { getBackendApiUrl } from "@/lib/backend-url";
 import { selectionLineLabel } from "@/lib/citation-parse";
 import { injectDocCitationsIntoBlocks } from "@/lib/inject-doc-citations";
 import { stripSourceColumnFromMarkdownTables } from "@/lib/strip-markdown-table-source-column";
+import { stripSourceColumnFromTableBlocks } from "@/lib/strip-table-source-column-blocks";
 
 /**
  * 落库 / 再载入前统一整理 Markdown，减轻 BlockNote「HTML→Markdown→解析」往返放大空行：
@@ -169,12 +170,13 @@ const BlockNoteEditorRuntime = forwardRef<EditorRewriteHandle, BlockNoteEditorRu
   });
 
   const getDocumentMarkdown = (): string => {
-    // blocksToMarkdown 需要 editor.pmSchema + editor 实例
-    // document 内部结构兼容 PartialBlock（保守 cast，避免泛型类型噪音）
-    const markdown = blocksToMarkdown(
+    // 先按块剥离「来源」列：BlockNote 导出 Markdown 时常为 HTML 表，GFM 行级剥离碰不到
+    const docForExport = stripSourceColumnFromTableBlocks(
       editor.document as unknown as PartialBlock[],
+    );
+    const markdown = blocksToMarkdown(
+      docForExport,
       editor.pmSchema,
-      // 自定义 inline schema 与默认 BlockNoteEditor 泛型在 TS 中不完全一致，运行时兼容
       editor as never,
       {},
     );
@@ -211,8 +213,9 @@ const BlockNoteEditorRuntime = forwardRef<EditorRewriteHandle, BlockNoteEditorRu
         parsedBlocks && parsedBlocks.length > 0
           ? (parsedBlocks as unknown as PartialBlock[])
           : buildDocumentBlocks(safeMarkdown);
+      const tableStripped = stripSourceColumnFromTableBlocks(rawBlocks);
       const nextBlocks = collapseConsecutiveEmptyParagraphs(
-        injectDocCitationsIntoBlocks(rawBlocks),
+        injectDocCitationsIntoBlocks(tableStripped),
       );
       editor.replaceBlocks(editor.document, nextBlocks);
       onDocumentTextChange?.(getDocumentMarkdown());

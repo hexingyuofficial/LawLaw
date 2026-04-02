@@ -4,22 +4,35 @@
  * 不处理代码围栏内的内容。
  */
 
+/** 表头单元格规范化：去格式、零宽字符、常见全角空白 */
+function normalizeHeaderLabel(cell: string): string {
+  return cell
+    .replace(/\u200B|\uFEFF/g, "")
+    .replace(/\*+/g, "")
+    .replace(/`/g, "")
+    .replace(/\s+/g, "")
+    .replace(/\u3000/g, "");
+}
+
+/**
+ * 拆 GFM 表格行。兼容行末无 `|`（BlockNote / 部分模型导出），否则整表无法进入处理流程。
+ */
 function parseTableRow(line: string): string[] | null {
-  const t = line.trimEnd();
-  const s = t.trimStart();
-  if (!s.startsWith("|")) {
+  const t = line.trim();
+  if (!t.startsWith("|")) {
     return null;
   }
-  const trimmed = t.trim();
-  if (!trimmed.endsWith("|")) {
+  const core = t.endsWith("|") ? t.slice(1, -1) : t.slice(1);
+  if (!core.trim()) {
     return null;
   }
-  const inner = trimmed.slice(1, -1);
-  return inner.split("|").map((c) => c.trim());
+  const cells = core.split("|").map((c) => c.trim());
+  return cells.length > 0 ? cells : null;
 }
 
 function isTableRowLine(line: string): boolean {
-  return parseTableRow(line) !== null;
+  const c = parseTableRow(line);
+  return c !== null && c.length >= 1;
 }
 
 function isSeparatorCells(cells: string[]): boolean {
@@ -32,12 +45,23 @@ function isSeparatorCells(cells: string[]): boolean {
   });
 }
 
-/** 与表头比对：仅当列标题就是「来源 / 出处 / 依据」时才剥离，避免误伤「审理依据」等 */
-function findSourceOnlyColumnIndex(headerCells: string[]): number {
-  return headerCells.findIndex((c) => {
-    const n = c.replace(/\*+/g, "").replace(/`/g, "").replace(/\s+/g, "");
-    return n === "来源" || n === "出处" || n === "依据";
-  });
+/** 仅剥离「最后一列」且标题为来源类，避免误伤中间列「审理依据」等（Markdown 与 BlockNote 表格块共用） */
+export function findTrailingSourceColumnIndex(headerCells: string[]): number {
+  if (headerCells.length === 0) {
+    return -1;
+  }
+  const last = headerCells.length - 1;
+  const n = normalizeHeaderLabel(headerCells[last] ?? "");
+  if (
+    n === "来源" ||
+    n === "出处" ||
+    n === "依据" ||
+    n === "来源文件" ||
+    n === "文件来源"
+  ) {
+    return last;
+  }
+  return -1;
 }
 
 function emitRow(cells: string[]): string {
@@ -53,10 +77,16 @@ function processTableLines(tableLines: string[]): { lines: string[]; footnotes: 
   }
   const header = parseTableRow(tableLines[0]);
   const sep = parseTableRow(tableLines[1]);
-  if (!header || !sep || !isSeparatorCells(sep)) {
+  if (
+    !header ||
+    !sep ||
+    !isSeparatorCells(sep) ||
+    sep.length !== header.length ||
+    header.length < 2
+  ) {
     return { lines: tableLines, footnotes: [] };
   }
-  const srcIdx = findSourceOnlyColumnIndex(header);
+  const srcIdx = findTrailingSourceColumnIndex(header);
   if (srcIdx === -1) {
     return { lines: tableLines, footnotes: [] };
   }
