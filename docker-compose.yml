@@ -1,0 +1,90 @@
+version: "3.9"
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: lawlaw_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - BACKEND_BASE_URL=http://backend:8000
+    networks:
+      - lawlaw_net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: lawlaw_backend
+    restart: unless-stopped
+    depends_on:
+      - chroma_db
+      - ocr_service
+      - ollama_service
+    ports:
+      - "8000:8000"
+    environment:
+      - CHROMA_HOST=chroma_db
+      - CHROMA_PORT=8000
+      - OLLAMA_BASE_URL=http://ollama_service:11434
+      - OCR_BASE_URL=http://ocr_service:8080
+      - PYTHONUNBUFFERED=1
+    networks:
+      - lawlaw_net
+
+  chroma_db:
+    image: chromadb/chroma:0.5.5
+    container_name: lawlaw_chroma
+    restart: unless-stopped
+    ports:
+      - "8010:8000"
+    volumes:
+      - ./data/chroma:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    networks:
+      - lawlaw_net
+
+  ollama_service:
+    image: ollama/ollama:latest
+    container_name: lawlaw_ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./data/ollama:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - lawlaw_net
+
+  ocr_service:
+    build:
+      context: ./ocr_service
+      dockerfile: Dockerfile
+    container_name: lawlaw_ocr
+    restart: unless-stopped
+    ports:
+      - "8088:8080"
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - lawlaw_net
+
+networks:
+  lawlaw_net:
+    driver: bridge
